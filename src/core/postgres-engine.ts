@@ -26,7 +26,13 @@ import { sanitizeForJsonb, buildLinkRows, buildTimelineRows, buildTakeRows } fro
 import { runMigrations } from './migrate.ts';
 import { SCHEMA_SQL } from './schema-embedded.ts';
 import { verifySchema } from './schema-verify.ts';
-import { applyChunkEmbeddingIndexPolicy, dropZombieIndexes } from './vector-index.ts';
+import {
+  applyChunkEmbeddingIndexPolicy,
+  dropZombieIndexes,
+  probeVectorCapabilities,
+  type VectorCapabilities,
+  type VectorIndexPolicyConfig,
+} from './vector-index.ts';
 import {
   normalizeEngineColumn,
   buildVectorCastFragment,
@@ -77,13 +83,14 @@ function escapeSqlStringLiteral(value: string): string {
 export function getPostgresSchema(
   dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
   model: string = DEFAULT_EMBEDDING_MODEL,
+  indexOpts?: { capabilities?: VectorCapabilities; config?: VectorIndexPolicyConfig },
 ): string {
   const parsedDims = Number(dims);
   if (!Number.isInteger(parsedDims) || parsedDims <= 0) {
     throw new Error(`Invalid embedding dimensions: ${dims}`);
   }
   const sanitizedModel = escapeSqlStringLiteral(String(model));
-  return applyChunkEmbeddingIndexPolicy(SCHEMA_SQL, parsedDims)
+  return applyChunkEmbeddingIndexPolicy(SCHEMA_SQL, parsedDims, indexOpts)
     .replace(/vector\(1536\)/g, `vector(${parsedDims})`)
     .replace(/'text-embedding-3-large'/g, `'${sanitizedModel}'`)
     .replace(/\('embedding_dimensions', '1536'\)/g, `('embedding_dimensions', '${parsedDims}')`);
@@ -384,7 +391,21 @@ export class PostgresEngine implements BrainEngine {
       model = gw.getEmbeddingModel() || model;
     } catch { /* gateway not yet configured — use defaults */ }
 
-    const sqlText = getPostgresSchema(dims, model);
+    // Optional pgvectorscale: probe once so high-dim (LiteLLM/vLLM native widths)
+    // can get diskann ANN instead of exact-scan. Feature-detected; no-op without extension.
+    let vectorCaps: VectorCapabilities | undefined;
+    try {
+      vectorCaps = await probeVectorCapabilities(this);
+      if (vectorCaps.diskann) {
+        process.stderr.write(
+          `  vector index: vectorscale ${vectorCaps.vectorscaleVersion ?? '?'} (diskann available)\n`,
+        );
+      }
+    } catch { /* best-effort */ }
+
+    const sqlText = getPostgresSchema(dims, model, vectorCaps
+      ? { capabilities: vectorCaps }
+      : undefined);
 
     // Advisory lock prevents concurrent initSchema() calls from deadlocking
     // on DDL statements (DROP TRIGGER + CREATE TRIGGER acquire AccessExclusiveLock).

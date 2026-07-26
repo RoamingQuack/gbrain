@@ -3,13 +3,27 @@ import {
   chunkEmbeddingIndexSql,
   applyChunkEmbeddingIndexPolicy,
   PGVECTOR_HNSW_VECTOR_MAX_DIMS,
+  selectChunkEmbeddingIndex,
+  emptyVectorCapabilities,
+  probeVectorCapabilities,
   checkActiveBuild,
   dropZombieIndexes,
   dropAndRebuild,
   isSupabaseAutoMaintenance,
   type ActiveBuildInfo,
   type IndexSpec,
+  type VectorCapabilities,
 } from '../src/core/vector-index.ts';
+
+const capsNoScale: VectorCapabilities = emptyVectorCapabilities('postgres');
+const capsWithScale: VectorCapabilities = {
+  engineKind: 'postgres',
+  pgvector: true,
+  pgvectorVersion: '0.8.0',
+  vectorscale: true,
+  vectorscaleVersion: '0.9.0',
+  diskann: true,
+};
 
 describe('chunkEmbeddingIndexSql — pre-v0.30.1 contract', () => {
   test('emits CREATE INDEX for dims ≤ 2000', () => {
@@ -18,7 +32,7 @@ describe('chunkEmbeddingIndexSql — pre-v0.30.1 contract', () => {
     expect(sql).toContain('hnsw');
   });
 
-  test('emits skip-comment for dims > 2000 (Voyage 3072)', () => {
+  test('emits skip-comment for dims > 2000 without vectorscale (Voyage 3072)', () => {
     const sql = chunkEmbeddingIndexSql(3072);
     expect(sql).toContain('skipped');
     expect(sql).not.toContain('CREATE INDEX');
@@ -27,8 +41,91 @@ describe('chunkEmbeddingIndexSql — pre-v0.30.1 contract', () => {
   test('boundary at exactly PGVECTOR_HNSW_VECTOR_MAX_DIMS (2000)', () => {
     const at = chunkEmbeddingIndexSql(PGVECTOR_HNSW_VECTOR_MAX_DIMS);
     expect(at).toContain('CREATE INDEX');
+    expect(at).toContain('hnsw');
     const above = chunkEmbeddingIndexSql(PGVECTOR_HNSW_VECTOR_MAX_DIMS + 1);
     expect(above).toContain('skipped');
+  });
+});
+
+describe('selectChunkEmbeddingIndex — pgvectorscale diskann', () => {
+  test('auto + high dims + vectorscale → diskann (LiteLLM/vLLM high-dim path)', () => {
+    const sel = selectChunkEmbeddingIndex(2560, capsWithScale, { backend: 'auto' });
+    expect(sel.am).toBe('diskann');
+    expect(sel.sql).toContain('USING diskann');
+    expect(sel.sql).toContain('vector_cosine_ops');
+    expect(sel.sql).toContain('memory_optimized');
+    expect(sel.sessionGucs['diskann.query_rescore']).toBe('50');
+  });
+
+  test('auto + high dims without vectorscale → exact scan (legacy)', () => {
+    const sel = selectChunkEmbeddingIndex(2560, capsNoScale, { backend: 'auto' });
+    expect(sel.am).toBe('none');
+    expect(sel.sql).toContain('skipped');
+    expect(sel.sql).toContain('vectorscale');
+  });
+
+  test('auto + 1536 + vectorscale → still HNSW by default', () => {
+    const sel = selectChunkEmbeddingIndex(1536, capsWithScale, { backend: 'auto' });
+    expect(sel.am).toBe('hnsw');
+    expect(sel.sql).toContain('hnsw');
+  });
+
+  test('preferDiskann + 1536 + vectorscale → diskann', () => {
+    const sel = selectChunkEmbeddingIndex(1536, capsWithScale, {
+      backend: 'auto',
+      preferDiskann: true,
+    });
+    expect(sel.am).toBe('diskann');
+  });
+
+  test('backend=diskann without extension falls back to HNSW when dims allow', () => {
+    const sel = selectChunkEmbeddingIndex(1536, capsNoScale, { backend: 'diskann' });
+    expect(sel.am).toBe('hnsw');
+    expect(sel.reason).toContain('fallback');
+  });
+
+  test('backend=none always exact', () => {
+    const sel = selectChunkEmbeddingIndex(512, capsWithScale, { backend: 'none' });
+    expect(sel.am).toBe('none');
+  });
+
+  test('chunkEmbeddingIndexSql opts pass-through for diskann', () => {
+    const sql = chunkEmbeddingIndexSql(3072, {
+      capabilities: capsWithScale,
+      config: { backend: 'auto' },
+    });
+    expect(sql).toContain('diskann');
+    expect(sql).not.toContain('skipped');
+  });
+});
+
+describe('probeVectorCapabilities', () => {
+  test('PGLite returns no diskann', async () => {
+    const fakeEngine = { kind: 'pglite' as const } as never;
+    const caps = await probeVectorCapabilities(fakeEngine);
+    expect(caps.diskann).toBe(false);
+    expect(caps.vectorscale).toBe(false);
+    expect(caps.engineKind).toBe('pglite');
+  });
+
+  test('Postgres with both extensions reports diskann', async () => {
+    const fakeEngine = {
+      kind: 'postgres' as const,
+      executeRaw: async (q: string) => {
+        if (q.includes('pg_extension')) {
+          return [
+            { extname: 'vector', extversion: '0.8.0' },
+            { extname: 'vectorscale', extversion: '0.9.0' },
+          ];
+        }
+        if (q.includes('pg_am')) return [{ amname: 'diskann' }];
+        return [];
+      },
+    } as never;
+    const caps = await probeVectorCapabilities(fakeEngine);
+    expect(caps.pgvector).toBe(true);
+    expect(caps.vectorscale).toBe(true);
+    expect(caps.diskann).toBe(true);
   });
 });
 
@@ -39,6 +136,16 @@ describe('applyChunkEmbeddingIndexPolicy', () => {
     expect(out).toContain('idx_chunks_embedding');
     const out2 = applyChunkEmbeddingIndexPolicy(input, 3072);
     expect(out2).toContain('skipped');
+  });
+
+  test('replaces with diskann SQL when capabilities provided', () => {
+    const input = `CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON content_chunks USING hnsw (embedding vector_cosine_ops);`;
+    const out = applyChunkEmbeddingIndexPolicy(input, 2560, {
+      capabilities: capsWithScale,
+      config: { backend: 'auto' },
+    });
+    expect(out).toContain('diskann');
+    expect(out).not.toContain('hnsw');
   });
 });
 

@@ -166,7 +166,20 @@ This is the catch-all for "my provider isn't in the list above." Set up LiteLLM,
 Three numbers matter:
 1. **Provider's native dims**: each model has a "true" output dim (e.g. OpenAI `text-embedding-3-large` is 3072 native).
 2. **Matryoshka reductions**: most modern providers let you request a smaller vector via the `dimensions` field.
-3. **HNSW cap**: pgvector's HNSW index supports up to 2000 dims. Brains above that fall back to exact vector scans (slower but correct; gbrain handles the SQL automatically via `chunkEmbeddingIndexSql` in `src/core/vector-index.ts`).
+3. **ANN index caps**:
+   - **HNSW** (pgvector): max **2000** dims on `vector`, **4000** on `halfvec`.
+   - Above 2000 on the primary `vector` column: without extra extensions, gbrain
+     **skips HNSW** and uses exact `<=>` scans (slower but correct) via
+     `chunkEmbeddingIndexSql` / `selectChunkEmbeddingIndex` in
+     `src/core/vector-index.ts`.
+   - **Optional pgvectorscale** (`CREATE EXTENSION vectorscale`): when the
+     `diskann` access method is present, high-dim primary embeddings (e.g. 2560
+     ZE full width, Voyage 2048, LiteLLM/vLLM models above 2000) can get
+     StreamingDiskANN instead of exact scan. Not available on PGLite or
+     Supabase today — see [`pgvectorscale.md`](./pgvectorscale.md).
+   - This matters for **user-hosted OpenAI-compatible embedders** (LiteLLM,
+     vLLM, private gateways) that declare custom high dims via
+     `trust_custom_dims` without Matryoshka-shrinking quality.
 
 For most users: **stay at 1024 or 1536**. Bigger isn't better below the noise floor; smaller saves disk + RAM with marginal recall loss on Matryoshka providers.
 
